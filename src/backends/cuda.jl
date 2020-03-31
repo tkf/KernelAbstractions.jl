@@ -2,48 +2,6 @@ import CUDAnative, CUDAdrv
 import CUDAnative: cufunction, DevicePtr
 import CUDAdrv: CuEvent, CuStream, CuDefaultStream, Mem
 
-const FREE_STREAMS = CuStream[]
-const STREAMS = CuStream[]
-const STREAM_GC_THRESHOLD = Ref{Int}(16)
-
-# This code is loaded after an `@init` step
-if haskey(ENV, "KERNELABSTRACTIONS_STREAMS_GC_THRESHOLD")
-    global STREAM_GC_THRESHOLD[] = parse(Int, ENV["KERNELABSTRACTIONS_STREAMS_GC_THRESHOLD"])
-end
-
-## Stream GC
-# Simplistic stream gc design in which when we have a total number
-# of streams bigger than a threshold, we start scanning the streams
-# and add them back to the freelist if all work on them has completed.
-# Alternative designs:
-# - Enqueue a host function on the stream that adds the stream back to the freelist
-# - Attach a finalizer to events that adds the stream back to the freelist
-# Possible improvements
-# - Add a background task that occasionally scans all streams
-# - Add a hysterisis by checking a "since last scanned" timestamp
-# - Add locking
-function next_stream()
-    if !isempty(FREE_STREAMS)
-        return pop!(FREE_STREAMS)
-    end
-
-    if length(STREAMS) > STREAM_GC_THRESHOLD[]
-        for stream in STREAMS
-            if CUDAdrv.query(stream)
-                push!(FREE_STREAMS, stream)
-            end
-        end
-    end
-
-    if !isempty(FREE_STREAMS)
-        return pop!(FREE_STREAMS)
-    end
-
-    stream = CUDAdrv.CuStream(CUDAdrv.STREAM_NON_BLOCKING)
-    push!(STREAMS, stream)
-    return stream
-end
-
 ###
 # Launch host func, asynchronously executes a function `f` on a stream.
 # The stream will NOT be blocked durin the execution of `f`.
@@ -60,6 +18,34 @@ function launch_host_func(f, stream::CuStream=CuDefaultStream())
     CUDAdrv.cuLaunchHostFunc(stream, callback, cond)
 end
 
+## Stream GC
+# Each use of `next_stream` should be matched with a `release_stream`
+# which will return the stream back to the freelist. `release_stream`
+# excutes as a task triggered by a `cuLaunchHostFunc` on the Julia
+# event loop.
+const STREAM_LOCK = Base.ReentrantLock()
+const FREE_STREAMS = CuStream[]
+
+function next_stream()
+    lock(STREAM_LOCK)
+    if !isempty(FREE_STREAMS)
+        stream = pop!(FREE_STREAMS)
+        unlock(STREAM_LOCK)
+        return stream
+    end
+    unlock(STREAM_LOCK)
+
+    stream = CUDAdrv.CuStream(CUDAdrv.STREAM_NON_BLOCKING)
+    return stream
+end
+
+function release_stream(stream)
+    launch_host_func(stream) do
+        lock(STREAM_LOCK)
+        push!(FREE_STREAMS, stream)
+        unlock(STREAM_LOCK)
+    end
+end
 
 struct CudaEvent <: Event
     event::CuEvent
@@ -85,6 +71,9 @@ function wait(::CPU, ev::CudaEvent, progress=nothing)
     wait(CUDA(), ev, nothing, stream)
     launch_host_func(stream) do
         notify(event)
+        lock(STREAM_LOCK)
+        push!(FREE_STREAMS, stream)
+        unlock(STREAM_LOCK)
     end
     wait(event)
 end
@@ -187,6 +176,7 @@ function async_copy!(::CUDA, A, B; dependencies=nothing, progress=yield)
     end
 
     CUDAdrv.record(event, stream)
+    release_stream(stream)
 
     return CudaEvent(event)
 end
@@ -232,6 +222,7 @@ function (obj::Kernel{CUDA})(args...; ndrange=nothing, dependencies=nothing, wor
                      Cassette.overdub(ctx, obj.f, args...))
 
     CUDAdrv.record(event, stream)
+    release_stream(stream)
     return CudaEvent(event)
 end
 
