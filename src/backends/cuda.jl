@@ -44,6 +44,23 @@ function next_stream()
     return stream
 end
 
+###
+# Launch host func, asynchronously executes a function `f` on a stream.
+# The stream will NOT be blocked durin the execution of `f`.
+###
+
+async_send(data::Ptr{Cvoid}) = ccall(:uv_async_send, Cint, (Ptr{Cvoid},), data)
+function launch_host_func(f, stream::CuStream=CuDefaultStream())
+    cond = Base.AsyncCondition() do async_cond
+        f()
+        close(async_cond)
+    end
+
+    callback = @cfunction(async_send, Cint, (Ptr{Cvoid},))
+    CUDAdrv.cuLaunchHostFunc(stream, callback, cond)
+end
+
+
 struct CudaEvent <: Event
     event::CuEvent
 end
@@ -60,14 +77,16 @@ end
 
 wait(ev::CudaEvent, progress=yield) = wait(CPU(), ev, progress)
 
-function wait(::CPU, ev::CudaEvent, progress=yield)
-    if progress === nothing
-        CUDAdrv.synchronize(ev.event)
-    else
-        while !isdone(ev)
-            progress()
-        end
+function wait(::CPU, ev::CudaEvent, progress=nothing)
+    isdone(ev) && return nothing
+
+    event = Base.Threads.Event()
+    stream = next_stream()
+    wait(CUDA(), ev, nothing, stream)
+    launch_host_func(stream) do
+        notify(event)
     end
+    wait(event)
 end
 
 # Use this to synchronize between computation using the CuDefaultStream
