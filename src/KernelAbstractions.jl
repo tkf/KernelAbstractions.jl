@@ -462,6 +462,7 @@ __size(i::Int) = Tuple{i}
 
 include("backends/cpu.jl")
 include("backends/cuda.jl")
+include("backends/rocm.jl")
 
 ###
 # Extras
