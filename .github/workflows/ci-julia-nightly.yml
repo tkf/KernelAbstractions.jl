@@ -1,5 +1,6 @@
 name: CI (Julia nightly)
 on:
+  pull_request:
   push:
     branches:
       - master

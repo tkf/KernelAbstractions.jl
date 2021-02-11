@@ -1,5 +1,6 @@
 name: CI (Julia 1.6-nightly)
 on:
+  pull_request:
   push:
     branches:
       - master
